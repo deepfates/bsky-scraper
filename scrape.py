@@ -99,7 +99,7 @@ class FirehoseScraper:
             else:
                 self.process_message(message)
 
-        max_retries = 3
+        max_retries = 100
         retry_delay = 5  # seconds
         retry_count = 0
 
