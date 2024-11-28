@@ -142,9 +142,6 @@ class FirehoseScraper:
             p.start()
             self.workers.append(p)
 
-        max_retries = 3
-        retry_count = 0
-        sleep_duration = 5  # Initial sleep duration in seconds
 
         # Handle KeyboardInterrupt in the main process
         def signal_handler(sig, frame):
@@ -154,7 +151,7 @@ class FirehoseScraper:
 
         signal.signal(signal.SIGINT, signal_handler)
 
-        while retry_count < max_retries:
+        while True:
             # Start the client in a separate process
             self.client_proc = multiprocessing.Process(
                 target=client_process,
@@ -179,16 +176,9 @@ class FirehoseScraper:
                         if not self.stop_event.is_set():
                             # Client process exited unexpectedly
                             print("\nClient process exited unexpectedly.")
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                print(f"Retrying ({retry_count}/{max_retries}) in {sleep_duration} seconds...")
-                                time.sleep(sleep_duration)
-                                sleep_duration *= 2  # Exponential backoff
-                                break  # Break out to restart the client process
-                            else:
-                                print("Max retries reached. Exiting.")
-                                self._stop_collection()
-                                break
+                            self._stop_collection()
+
+                            break
                         else:
                             # Stop event is set; exit the loop
                             break
@@ -203,16 +193,8 @@ class FirehoseScraper:
                 self._stop_collection()
                 break
             except Exception as e:
-                print(f"\nError: {e}")
-                self._stop_collection()
-                retry_count += 1
-                if retry_count < max_retries:
-                    print(f"Retrying ({retry_count}/{max_retries}) in {sleep_duration} seconds...")
-                    time.sleep(sleep_duration)
-                    sleep_duration *= 2  # Exponential backoff
-                else:
-                    print("Max retries reached. Exiting.")
-                    break
+                error_details = f"{type(e).__name__}: {str(e)}" if str(e) else f"{type(e).__name__}"
+                print(f"\nConnection error: {error_details}")
 
         self._stop_collection()
 
