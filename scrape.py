@@ -4,44 +4,47 @@ from atproto import FirehoseSubscribeReposClient, parse_subscribe_repos_message,
 import time
 import argparse
 from datetime import datetime
+import multiprocessing
+import sys
+import signal
 
 class FirehoseScraper:
-    def __init__(self, database_path="bluesky_posts.db", verbose=False):
+    def __init__(self, database_path="bluesky_posts.db", verbose=False, num_workers=4):
         """
         Initialize the scraper with a SQLite database connection.
         
         Args:
             database_path (str): Path to the SQLite database file
             verbose (bool): Enable detailed logging of collected posts
+            num_workers (int): Number of worker processes for parallel processing
         """
         # Firehose client setup
         self.client = FirehoseSubscribeReposClient()
         self.database_path = database_path
-        
-        # Database connection and cursor
-        self.conn = sqlite3.connect(database_path)
-        self.cursor = self.conn.cursor()
-        
-        # Create tables if they don't exist
-        self._create_tables()
-        
-        # Additional tracking variables
-        self.post_count = 0
+        self.verbose = verbose
+        self.num_workers = num_workers
+        self.post_count = multiprocessing.Value('i', 0)
         self.start_time = None
-        
+        self.queue = multiprocessing.Queue()
+        self.workers = []
+        self.stop_event = multiprocessing.Event()
+        self.lock = multiprocessing.Lock()  # For thread-safe database access
+        self.client_proc = None
+
+        # Initialize database connection
+        self.conn = sqlite3.connect(self.database_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self._setup_database()
+
         # DID resolution
         self.cache = DidInMemoryCache() 
         self.resolver = IdResolver(cache=self.cache)
-        
-        # Verbosity flag
-        self.verbose = verbose
 
-    def _create_tables(self):
+    def _setup_database(self):
         """
         Create database tables for storing Bluesky posts and related information.
         Includes indexes for efficient querying.
         """
-        # Posts table with comprehensive schema
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +67,82 @@ class FirehoseScraper:
         # Commit the table creation
         self.conn.commit()
 
-    def process_message(self, message) -> None:
+    def start_collection(self, duration_seconds=None, post_limit=None):
+        """Start collecting posts from the firehose"""
+        print(f"Starting collection{f' for {post_limit} posts' if post_limit else ''}...")
+        self.start_time = time.time()
+        end_time = self.start_time + duration_seconds if duration_seconds else None
+
+        # Start worker processes
+        for _ in range(self.num_workers):
+            p = multiprocessing.Process(
+                target=self.worker_process,
+                args=(self.queue, self.post_count, self.lock, self.stop_event)
+            )
+            p.start()
+            self.workers.append(p)
+
+        # Setup signal handler for graceful shutdown
+        def signal_handler(sig, frame):
+            print("\nCollection stopped by user.")
+            self._stop_collection()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+
+        # Start the client process
+        self.client_proc = multiprocessing.Process(
+            target=self.client_process,
+            args=(self.queue, self.stop_event)
+        )
+        self.client_proc.start()
+
+        # Monitor the collection
+        try:
+            while True:
+                if self.stop_event.is_set():
+                    break
+                if duration_seconds and time.time() > end_time:
+                    print("\nTime limit reached.")
+                    self._stop_collection()
+                    break
+                elif post_limit and self.post_count.value >= post_limit:
+                    print("\nPost limit reached.")
+                    self._stop_collection()
+                    break
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nCollection interrupted by user.")
+            self._stop_collection()
+
+    def worker_process(self, queue, post_count, lock, stop_event):
+        while not stop_event.is_set():
+            try:
+                message = queue.get(timeout=1)
+                self.process_message(message, lock)
+                with post_count.get_lock():
+                    post_count.value += 1
+            except multiprocessing.queues.Empty:
+                continue
+            except Exception as e:
+                print(f"Worker error: {e}")
+
+    def client_process(self, queue, stop_event):
+        client = FirehoseSubscribeReposClient()
+
+        def message_handler(message):
+            if stop_event.is_set():
+                client.stop()
+                return
+            queue.put(message)
+
+        try:
+            client.start(message_handler)
+        except Exception as e:
+            if not stop_event.is_set():
+                print(f"Client process error: {e}")
+
+    def process_message(self, message, lock):
         """Process a single message from the firehose"""
         try:
             commit = parse_subscribe_repos_message(message)
@@ -73,12 +151,12 @@ class FirehoseScraper:
 
             for op in commit.ops:
                 if op.action == 'create' and op.path.startswith('app.bsky.feed.post/'):
-                    self._process_post(commit, op)
+                    self._process_post(commit, op, lock)
 
         except Exception as e:
             print(f"Error processing message: {e}")
 
-    def _process_post(self, commit, op):
+    def _process_post(self, commit, op, lock):
         """Process a single post operation and save to SQLite"""
         try:
             author_handle = self._resolve_author_handle(commit.repo)
@@ -86,7 +164,7 @@ class FirehoseScraper:
             for record in car.blocks.values():
                 if isinstance(record, dict) and record.get('$type') == 'app.bsky.feed.post':
                     post_data = self._extract_post_data(record, commit.repo, op.path, author_handle)
-                    self._save_post_data(post_data, record)
+                    self._save_post_data(post_data, record, lock)
         except Exception as e:
             print(f"Error processing record: {e}")
 
@@ -125,69 +203,54 @@ class FirehoseScraper:
         reply_ref = record.get('reply', {})
         return reply_ref.get('parent', {}).get('uri')
 
-    def _save_post_data(self, post_data, raw_record):
+    def _save_post_data(self, post_data, raw_record, lock):
         """Save post data to SQLite database"""
         try:
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO posts 
-                (uri, author, text, created_at, has_images, reply_to, raw_record) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                post_data['uri'], 
-                post_data['author'], 
-                post_data['text'], 
-                post_data['created_at'], 
-                post_data['has_images'], 
-                post_data['reply_to'], 
-                str(raw_record)  # Convert the entire raw record to a string
-            ))
-            self.conn.commit()
+            with lock:
+                self.cursor.execute('''
+                    INSERT OR REPLACE INTO posts 
+                    (uri, author, text, created_at, has_images, reply_to, raw_record) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    post_data['uri'], 
+                    post_data['author'], 
+                    post_data['text'], 
+                    post_data['created_at'], 
+                    post_data['has_images'], 
+                    post_data['reply_to'], 
+                    str(raw_record)  # Convert the entire raw record to a string
+                ))
+                self.conn.commit()
             
-            self.post_count += 1
             if self.verbose:
                 print(f"Saved post by @{post_data['author']}: {post_data['text'][:50]}...")
         
         except sqlite3.Error as e:
             print(f"Database error: {e}")
 
-    def start_collection(self, duration_seconds=None, post_limit=None):
-        """Start collecting posts from the firehose"""
-        print(f"Starting collection{f' for {post_limit} posts' if post_limit else ''}...")
-        self.start_time = time.time()
-        end_time = self.start_time + duration_seconds if duration_seconds else None
-
-        def message_handler(message):
-            if duration_seconds and time.time() > end_time:
-                self._stop_collection()
-            elif post_limit and self.post_count >= post_limit:
-                self._stop_collection()
-            else:
-                self.process_message(message)
-
-        try:
-            while True:
-                try:
-                    self.client.start(message_handler)
-                except Exception as e:
-                    error_details = f"{type(e).__name__}: {str(e)}" if str(e) else f"{type(e).__name__}"
-                    print(f"\nConnection error: {error_details}")
-
-        except KeyboardInterrupt:
-            print("\nCollection stopped by user.")
-            self._stop_collection()
-
     def _stop_collection(self):
         """Stop the collection, print summary, and close database connection"""
-        elapsed = time.time() - self.start_time
-        rate = self.post_count / elapsed if elapsed > 0 else 0
+        if not self.stop_event.is_set():
+            self.stop_event.set()
+
+        if self.client_proc and self.client_proc.is_alive():
+            self.client_proc.terminate()
+            self.client_proc.join()
+
+        for p in self.workers:
+            if p.is_alive():
+                p.terminate()
+            p.join()
+
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        rate = self.post_count.value / elapsed if elapsed > 0 else 0
         print("\nCollection complete!")
-        print(f"Collected {self.post_count} posts in {elapsed:.2f} seconds")
+        print(f"Collected {self.post_count.value} posts in {elapsed:.2f} seconds")
         print(f"Average rate: {rate:.1f} posts/sec")
         print(f"Output saved to: {self.database_path}")
-        
+
         # Close database connection
         self.conn.close()
-        self.client.stop()
 
     def query_posts(self, limit=10, filter_condition=None):
         """
