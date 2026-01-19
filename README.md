@@ -2,7 +2,7 @@
 
 This is a Python script that collects posts from the Bluesky firehose and saves them to a JSONL file. This tool is designed to be easy to set up and use, making it accessible for anyone interested in archiving Bluesky posts.
 
-[See the original post about this on Bluesky.](https://bsky.app/profile/deepfates.com.deepfates.com.deepfates.com.deepfates.com.deepfates.com/post/3lb67tepryc23)
+[See the original post about this on Bluesky.](https://bsky.app/profile/deepfates.com.deepfates.com.deepfates.com.deepfates.com.deepfates.com/post/3lbxf5jxqec2e)
 
 ## Features
 
