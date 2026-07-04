@@ -42,7 +42,11 @@ This is a Python script that collects posts from the Bluesky firehose and saves 
    poetry run python scrape.py
    ```
 
-   By default, the script collects posts for 30 seconds. You can adjust the duration by modifying the `duration_seconds` parameter in the `start_collection` method.
+   By default, the script runs indefinitely, collecting posts until you stop it (Ctrl+C). Use `-t SECONDS` to stop after a fixed duration, or `-n COUNT` to stop after collecting a set number of posts:
+
+   ```bash
+   poetry run python scrape.py -t 30
+   ```
 
 2. **Output:**
 
